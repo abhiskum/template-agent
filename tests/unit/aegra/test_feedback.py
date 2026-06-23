@@ -7,7 +7,8 @@ from pydantic import ValidationError
 from starlette.requests import Request
 from starlette.testclient import TestClient
 
-from deep_agent.aegra.feedback import app, feedback_handler, record_feedback
+from deep_agent.aegra.feedback import feedback_handler, record_feedback
+from deep_agent.aegra.http_app import app
 
 
 class TestRecordFeedback:

@@ -51,7 +51,7 @@ Client examples (Streamlit, Python async) are in [`examples/`](./examples/).
 | `POSTGRES_DB` | `pgvector` | Yes |
 | `POSTGRES_HOST` | `pgvector` | Yes |
 | `POSTGRES_PORT` | `5432` | Yes |
-| `REDIS_URL` | `redis://redis:6379/0` | No |
+| `REDIS_URL` | `redis://redis:6379/0` | No (Yes for `oauth` / `dcr` MCPs) |
 | `GOOGLE_SERVICE_ACCOUNT_FILE` | — | Yes |
 | `LANGFUSE_PUBLIC_KEY` | — | No |
 | `LANGFUSE_SECRET_KEY` | — | No |
@@ -59,8 +59,234 @@ Client examples (Streamlit, Python async) are in [`examples/`](./examples/).
 | `LANGFUSE_TRACING_ENVIRONMENT` | `development` | No |
 | `SSL_KEYFILE` | — | No |
 | `SSL_CERTFILE` | — | No |
+| `MCP_TOKEN_ENCRYPTION_KEY` | — | Yes (for `oauth` / `dcr` MCPs) |
+| `AGENT_PUBLIC_BASE_URL` | `http://localhost:{AGENT_PORT}` | Yes (for `oauth` / `dcr` in production) |
 
 Runtime configuration (cache TTLs, memory settings, agent identity) is in `config/agent/runtime/agent.yaml`.
+
+## MCP Server Configuration
+
+MCP servers are defined in `config/agent/mcp.json` and attached to agents via the
+`mcps` frontmatter field in `config/agent/PROMPT.md` (orchestrator) or
+`config/agent/subagents/*.md`. Subagents that omit `mcps` inherit the
+orchestrator's MCP list.
+
+### Auth modes
+
+| `auth_mode` | When to use | How credentials work |
+|---|---|---|
+| `sso` (default) | MCP accepts the same SSO token as the agent (e.g. RH-SSO) | User's request Bearer token is forwarded to the MCP on every tool call |
+| `oauth` | MCP has a pre-registered OAuth client | User connects once via the chat UI; per-user tokens are stored in Postgres |
+| `dcr` | MCP supports OAuth Dynamic Client Registration | Agent registers a client at startup/connect, then same per-user OAuth flow as `oauth` |
+
+Set `"auth": false` to call an MCP without an `Authorization` header (public/local servers only).
+
+### `mcp.json` schema
+
+Each entry under `mcpServers` is keyed by a **server name** (referenced in agent frontmatter).
+The name must match exactly in `mcps:` lists.
+
+#### Common properties (all modes)
+
+| Property | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `url` | string | **Yes** | — | MCP server endpoint (e.g. `http://localhost:5001/mcp`) |
+| `transport` | string | No | `streamable_http` | MCP transport (`streamable_http`, `http`, etc.) |
+| `enabled` | boolean | No | `true` | When `false`, the server is ignored at runtime |
+| `auth` | boolean | No | `true` | When `false`, no Bearer token is sent |
+| `auth_mode` | string | No | `sso` | One of `sso`, `oauth`, `dcr` |
+| `ssl_verify` | boolean | No | `true` | TLS certificate verification for MCP HTTP calls |
+| `timeout` | number | No | `30` | Connection timeout in seconds |
+
+#### SSO example
+
+Use when the MCP server validates the same SSO access token as the agent (token pass-through).
+
+```json
+{
+  "mcpServers": {
+    "template-mcp-server": {
+      "url": "http://localhost:5001/mcp",
+      "transport": "streamable_http",
+      "enabled": true,
+      "auth": true,
+      "auth_mode": "sso",
+      "ssl_verify": false,
+      "timeout": 30
+    }
+  }
+}
+```
+
+**Required:** `url`
+**No `oauth` block needed.**
+
+#### OAuth example (pre-registered client)
+
+Use when you already have a `client_id` (and optionally `client_secret`) from the MCP
+provider. Users connect through the chat UI before tools are available.
+
+```json
+{
+  "mcpServers": {
+    "my-oauth-mcp": {
+      "url": "https://mcp.example.com/mcp",
+      "transport": "streamable_http",
+      "enabled": true,
+      "auth": true,
+      "auth_mode": "oauth",
+      "ssl_verify": true,
+      "timeout": 30,
+      "oauth": {
+        "client_id": "your-client-id",
+        "client_secret": "your-client-secret",
+        "authorization_endpoint": "https://auth.example.com/authorize",
+        "token_endpoint": "https://auth.example.com/token",
+        "redirect_uri": "http://localhost:5002/mcp/oauth/callback",
+        "scopes": ["read", "write"]
+      }
+    }
+  }
+}
+```
+
+**Required `oauth` fields for `auth_mode: "oauth"`:**
+
+| Field | Required | Description |
+|---|---|---|
+| `client_id` | **Yes** | Pre-registered OAuth client ID |
+| `authorization_endpoint` | **Yes** | Authorization URL |
+| `token_endpoint` | **Yes** | Token exchange URL |
+| `redirect_uri` | **Yes** | Must be `{AGENT_PUBLIC_BASE_URL}/mcp/oauth/callback` |
+| `client_secret` | No | Client secret (if the provider issued one) |
+| `scopes` | No | OAuth scopes (array of strings) |
+
+#### DCR example (dynamic client registration)
+
+Use when the MCP provider exposes a registration endpoint (e.g. Atlassian MCP, local
+`template-mcp-server-rh-sso`). The agent registers itself and stores the resulting
+`client_id` in Postgres — no manual `client_id` in config.
+
+```json
+{
+  "mcpServers": {
+    "jira-mcp-server-dcr": {
+      "url": "https://mcp.atlassian.com/v1/mcp/authv2",
+      "transport": "streamable_http",
+      "enabled": true,
+      "auth": true,
+      "auth_mode": "dcr",
+      "ssl_verify": true,
+      "timeout": 30,
+      "oauth": {
+        "authorization_endpoint": "https://mcp.atlassian.com/v1/authorize",
+        "token_endpoint": "https://cf.mcp.atlassian.com/v1/token",
+        "registration_endpoint": "https://cf.mcp.atlassian.com/v1/register",
+        "redirect_uri": "http://localhost:5002/mcp/oauth/callback",
+        "scopes": ["jira:read"]
+      }
+    }
+  }
+}
+```
+
+**Required `oauth` fields for `auth_mode: "dcr"`:**
+
+| Field | Required | Description |
+|---|---|---|
+| `authorization_endpoint` | **Yes** | Authorization URL |
+| `token_endpoint` | **Yes** | Token exchange and refresh URL |
+| `registration_endpoint` | **Yes** | DCR registration URL |
+| `redirect_uri` | **Yes** | Must be `{AGENT_PUBLIC_BASE_URL}/mcp/oauth/callback` |
+| `scopes` | No | OAuth scopes requested at registration and authorize time |
+
+`client_id` and `client_secret` are **not** set in config — they are created at runtime
+and stored in the `mcp_oauth_clients` table.
+
+#### Unauthenticated example
+
+```json
+{
+  "mcpServers": {
+    "local-mock-mcp": {
+      "url": "http://localhost:8000/mcp",
+      "transport": "streamable_http",
+      "enabled": true,
+      "auth": false
+    }
+  }
+}
+```
+
+### Wiring MCPs to agents
+
+Reference server names from `mcp.json` in agent frontmatter:
+
+```yaml
+---
+name: jira
+model: gemini-2.5-pro
+mcps:
+  - jira-mcp-server-dcr
+tools:
+  - searchJiraIssuesUsingJql
+  - getJiraIssue
+---
+```
+
+- **Orchestrator:** add `mcps:` to `config/agent/PROMPT.md` frontmatter.
+- **Subagent:** add `mcps:` to `config/agent/subagents/<name>.md` frontmatter.
+- **Inheritance:** subagents without `mcps` inherit the orchestrator's list.
+- **Validation:** every name in `mcps` must exist in `mcp.json` and have `enabled: true`.
+
+### Environment variables for OAuth / DCR
+
+When using `auth_mode: "oauth"` or `"dcr"`:
+
+```bash
+# Fernet key for encrypting tokens at rest in Postgres (required)
+# Generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+MCP_TOKEN_ENCRYPTION_KEY=...
+
+# Public URL where the agent is reachable (used in redirect_uri and connect URLs)
+# Must match oauth.redirect_uri host in mcp.json
+AGENT_PUBLIC_BASE_URL=http://localhost:5002
+
+# Redis stores short-lived OAuth PKCE state during the connect flow (required)
+REDIS_URL=redis://localhost:6379/0
+
+# Postgres stores per-user tokens and DCR client records (required)
+POSTGRES_HOST=...
+```
+
+In production behind a gateway or ingress, set `AGENT_PUBLIC_BASE_URL` to the
+externally reachable agent URL and update every `oauth.redirect_uri` in `mcp.json`
+to `{AGENT_PUBLIC_BASE_URL}/mcp/oauth/callback`.
+
+### OAuth HTTP endpoints
+
+These routes are registered on the Aegra custom app (`deep_agent/aegra/http_app.py`):
+
+| Endpoint | Method | Auth | Description |
+|---|---|---|---|
+| `/mcp/{name}/connect` | POST | Bearer (SSO) | Start OAuth flow; returns `{ "authorize_url": "..." }` |
+| `/mcp/oauth/callback` | GET | None (state-bound) | OAuth redirect target; exchanges code and stores tokens |
+| `/mcp/{name}/status` | GET | Bearer (SSO) | Returns `{ "connected": true/false }` for the current user |
+| `/info` | GET | None | Returns agent name and list of OAuth/DCR MCP server names |
+
+The chat UI calls connect/status through its BFF proxy. The OAuth provider redirects
+the user's browser directly to `/mcp/oauth/callback` on the agent.
+
+### Choosing an auth mode
+
+| Scenario | Recommended mode |
+|---|---|
+| MCP shares RH-SSO / Keycloak with the agent | `sso` |
+| MCP issued you a static OAuth client | `oauth` |
+| MCP supports RFC 7591 dynamic registration (Atlassian, template-mcp-server-rh-sso) | `dcr` |
+| Local dev mock with no auth | `auth: false` |
+
+See `config/agent/mcp.json` for working examples of `sso`, `dcr`, and Jira/Atlassian MCP.
 
 ## Project Structure
 

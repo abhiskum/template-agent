@@ -110,7 +110,18 @@ class Settings(BaseSettings):
     # ── FLAG TO SWITCH TO RELOAD FROM DISK ────────────────────────────
     CONFIG_AUTO_RELOAD: bool = Field(default=False)
 
+    # ── MCP OAuth ─────────────────────────────────────────────────────
+    MCP_TOKEN_ENCRYPTION_KEY: Optional[str] = Field(default=None)
+    AGENT_PUBLIC_BASE_URL: Optional[str] = Field(default=None)
+
     # ── Derived ───────────────────────────────────────────────────────
+
+    @property
+    def agent_public_base_url(self) -> str:
+        """Public base URL for MCP OAuth connect/callback endpoints."""
+        if self.AGENT_PUBLIC_BASE_URL:
+            return self.AGENT_PUBLIC_BASE_URL.rstrip("/")
+        return f"http://localhost:{self.AGENT_PORT}"
 
     @property
     def database_uri(self) -> str:

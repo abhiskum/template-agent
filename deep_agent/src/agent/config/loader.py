@@ -16,6 +16,7 @@ Classes:
 """
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -40,9 +41,12 @@ logger = get_python_logger(log_level=settings.PYTHON_LOG_LEVEL)
 
 # Config directory path - read from CONFIG_PATH env var for base image pattern
 # Falls back to repo-root config/agent/ for backward compatibility
-import os
-_AGENT_CONFIG_DIR = Path(os.getenv("CONFIG_PATH",
-    str(Path(__file__).parent.parent.parent.parent.parent / "config" / "agent")))
+_AGENT_CONFIG_DIR = Path(
+    os.getenv(
+        "CONFIG_PATH",
+        str(Path(__file__).parent.parent.parent.parent.parent / "config" / "agent"),
+    )
+)
 
 
 class AgentConfig:
@@ -124,7 +128,7 @@ class AgentConfig:
             if self._configs_loaded:
                 logger.debug("CONFIG_AUTO_RELOAD=true: reloading configs from disk")
             self._configs_loaded = False
-        
+
         if self._configs_loaded:
             return
 
@@ -188,9 +192,7 @@ class AgentConfig:
         Raises:
             AppException: If ``mcps`` is not a list of strings.
         """
-        if not isinstance(mcps, list) or not all(
-            isinstance(s, str) for s in mcps
-        ):
+        if not isinstance(mcps, list) or not all(isinstance(s, str) for s in mcps):
             raise AppException(
                 f"Agent '{agent_name}': 'mcps' must be a list of strings",
                 ErrorCodes.CONFIGURATION_VALIDATION_ERROR,
@@ -274,6 +276,57 @@ class AgentConfig:
 
         return subagents
 
+    @staticmethod
+    def _validate_mcp_server(name: str, cfg: dict[str, Any]) -> None:
+        """Log clear errors for invalid per-MCP OAuth/DCR configuration."""
+        auth_mode = cfg.get("auth_mode", "sso")
+        cfg["auth_mode"] = auth_mode
+
+        if auth_mode not in ("sso", "oauth", "dcr"):
+            logger.error(
+                "MCP server '%s': invalid auth_mode '%s' (expected sso, oauth, or dcr)",
+                name,
+                auth_mode,
+            )
+            return
+
+        if auth_mode not in ("oauth", "dcr"):
+            return
+
+        oauth = cfg.get("oauth")
+        if not isinstance(oauth, dict):
+            logger.error(
+                "MCP server '%s': auth_mode '%s' requires an 'oauth' block",
+                name,
+                auth_mode,
+            )
+            return
+
+        for field in (
+            "authorization_endpoint",
+            "token_endpoint",
+            "redirect_uri",
+        ):
+            if not oauth.get(field):
+                logger.error(
+                    "MCP server '%s': oauth.%s is required for auth_mode '%s'",
+                    name,
+                    field,
+                    auth_mode,
+                )
+
+        if auth_mode == "oauth" and not oauth.get("client_id"):
+            logger.error(
+                "MCP server '%s': oauth.client_id is required for auth_mode 'oauth'",
+                name,
+            )
+
+        if auth_mode == "dcr" and not oauth.get("registration_endpoint"):
+            logger.error(
+                "MCP server '%s': oauth.registration_endpoint is required for auth_mode 'dcr'",
+                name,
+            )
+
     def _load_mcp_servers(self) -> dict[str, Any]:
         """Load MCP server configuration at initialization.
 
@@ -288,6 +341,9 @@ class AgentConfig:
         try:
             data = json.loads(mcp_path.read_bytes())
             servers: dict[str, Any] = data.get("mcpServers", {})
+            for name, cfg in servers.items():
+                if isinstance(cfg, dict):
+                    self._validate_mcp_server(name, cfg)
             logger.info(f"Loaded {len(servers)} MCP server config(s)")
             return servers
         except Exception as e:

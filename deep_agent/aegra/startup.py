@@ -96,6 +96,10 @@ async def _ensure_database() -> str:
         await repo.ensure_tables()
         feedback_repo = FeedbackRepository(settings.database_uri)
         await feedback_repo.ensure_table()
+        from deep_agent.aegra.mcp_token_store import McpTokenStore
+
+        mcp_token_store = McpTokenStore(settings.database_uri)
+        await mcp_token_store.ensure_tables()
         return "ok"
     except Exception as exc:
         logger.error("Database setup failed: %s", exc)
