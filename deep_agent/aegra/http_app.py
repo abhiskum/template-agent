@@ -6,6 +6,8 @@ application and merges core LangGraph Platform routes onto.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 from uuid import uuid4
 
@@ -14,6 +16,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from deep_agent.aegra.feedback import feedback_router
 from deep_agent.aegra.mcp_routes import router as mcp_router
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import (
     bind_request_context,
     clear_request_context,
@@ -60,7 +63,22 @@ from deep_agent.aegra.shutdown import register_atexit  # noqa: E402
 
 register_atexit()
 
-app = FastAPI(title="template-agent-custom")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    from deep_agent.aegra.startup import run_startup
+    from deep_agent.src.observability.otel_setup import (
+        setup_otel_metrics,
+        setup_otel_traces,
+    )
+
+    await run_startup()
+    setup_otel_metrics(settings, logger)
+    setup_otel_traces(_app, settings, logger)
+    yield
+
+
+app = FastAPI(title="template-agent-custom", lifespan=_lifespan)
 
 
 class TraceIDMiddleware(BaseHTTPMiddleware):
