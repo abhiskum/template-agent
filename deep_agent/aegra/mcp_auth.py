@@ -76,7 +76,7 @@ class McpCredentialResolver:
     """Resolve the bearer token to send to a specific MCP server."""
 
     def __init__(self, token_store: McpTokenStore | None = None) -> None:
-        """Initialize with an optional token store (defaults to Postgres)."""
+        """Initialize with an optional token store (defaults to Redis + Postgres)."""
         self._store = token_store or McpTokenStore(settings.database_uri)
         self._cache: dict[tuple[str, str], tuple[str, float]] = {}
 

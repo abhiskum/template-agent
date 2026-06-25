@@ -119,6 +119,19 @@ def cache_set(key: str, value: str, ttl_seconds: int = 300) -> bool:
         return False
 
 
+def cache_set_persistent(key: str, value: str) -> bool:
+    """Write a value to Redis without expiry. Returns False on error."""
+    client = get_redis_client()
+    if client is None:
+        return False
+    try:
+        client.set(f"{REDIS_KEY_PREFIX}{key}", value)
+        return True
+    except Exception:
+        logger.debug("Persistent cache write failed for key '%s'", key, exc_info=True)
+        return False
+
+
 def cache_delete(key: str) -> bool:
     """Delete a key from Redis cache. Returns False on error."""
     client = get_redis_client()

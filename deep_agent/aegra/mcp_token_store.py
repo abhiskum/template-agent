@@ -1,7 +1,9 @@
-"""Postgres repository for per-user MCP OAuth tokens and DCR client records."""
+"""Repository for MCP OAuth tokens (Redis) and DCR client records (Postgres)."""
 
 from __future__ import annotations
 
+import asyncio
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -11,11 +13,13 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from deep_agent.aegra.mcp_crypto import decrypt_secret, encrypt_secret
+from deep_agent.aegra.redis import cache_delete, cache_get, cache_set_persistent
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
 
 _TABLES_ENSURED = False
+_TOKEN_KEY_PREFIX = "mcp_oauth_token:"
 
 CREATE_OAUTH_CLIENTS_TABLE = """
 CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
@@ -27,34 +31,9 @@ CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
 );
 """
 
-CREATE_OAUTH_TOKENS_TABLE = """
-CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
-    user_id        TEXT NOT NULL,
-    mcp_name       TEXT NOT NULL,
-    access_token   TEXT NOT NULL,
-    refresh_token  TEXT,
-    expires_at     TIMESTAMPTZ,
-    scopes         TEXT[],
-    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (user_id, mcp_name)
-);
-"""
-
 MIGRATE_OAUTH_TABLES = """
 DO $$
 BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.tables
-        WHERE table_schema = 'public' AND table_name = 'mcp_oauth_tokens'
-    ) AND NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'mcp_oauth_tokens'
-          AND column_name = 'user_id'
-    ) THEN
-        DROP TABLE mcp_oauth_tokens;
-    END IF;
-
     IF EXISTS (
         SELECT 1 FROM information_schema.tables
         WHERE table_schema = 'public' AND table_name = 'mcp_oauth_clients'
@@ -109,23 +88,72 @@ class McpOAuthToken:
 
 
 class McpTokenStore:
-    """Async Postgres store for MCP OAuth clients and user tokens."""
+    """Async store for MCP OAuth user tokens (Redis) and DCR clients (Postgres)."""
 
     def __init__(self, database_uri: str) -> None:
-        """Initialize with a Postgres connection URI."""
+        """Initialize with a Postgres connection URI for DCR client records."""
         self._uri = database_uri
 
+    @staticmethod
+    def _token_key(user_id: str, mcp_name: str) -> str:
+        return f"{_TOKEN_KEY_PREFIX}{user_id}:{mcp_name}"
+
+    @staticmethod
+    def _serialize_datetime(value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC).isoformat()
+
+    @staticmethod
+    def _deserialize_datetime(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
+    def _token_to_payload(
+        self,
+        access_token: str,
+        refresh_token: str | None,
+        expires_at: datetime | None,
+        scopes: list[str] | None,
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        return {
+            "access_token": encrypt_secret(access_token),
+            "refresh_token": encrypt_secret(refresh_token),
+            "expires_at": self._serialize_datetime(expires_at),
+            "scopes": scopes,
+            "updated_at": self._serialize_datetime(now),
+        }
+
+    def _payload_to_token(
+        self, user_id: str, mcp_name: str, payload: dict[str, Any]
+    ) -> McpOAuthToken:
+        return McpOAuthToken(
+            user_id=user_id,
+            mcp_name=mcp_name,
+            access_token=decrypt_secret(payload.get("access_token")) or "",
+            refresh_token=decrypt_secret(payload.get("refresh_token")),
+            expires_at=self._deserialize_datetime(payload.get("expires_at")),
+            scopes=list(payload["scopes"]) if payload.get("scopes") else None,
+            updated_at=self._deserialize_datetime(payload.get("updated_at")),
+        )
+
     async def ensure_tables(self) -> None:
-        """Create MCP OAuth tables if they do not already exist."""
+        """Create MCP OAuth client table in Postgres if it does not already exist."""
         global _TABLES_ENSURED  # noqa: PLW0603
         async with await psycopg.AsyncConnection.connect(self._uri) as conn:
             await conn.execute(MIGRATE_OAUTH_TABLES)
             await conn.execute(CREATE_OAUTH_CLIENTS_TABLE)
-            await conn.execute(CREATE_OAUTH_TOKENS_TABLE)
             await conn.commit()
         if not _TABLES_ENSURED:
             _TABLES_ENSURED = True
-            logger.info("MCP OAuth tables ensured")
+            logger.info("MCP OAuth client table ensured")
 
     async def get_client(self, mcp_name: str) -> McpOAuthClient | None:
         """Return the registered OAuth client for *mcp_name*, if any."""
@@ -187,27 +215,27 @@ class McpTokenStore:
         )
 
     async def get_token(self, user_id: str, mcp_name: str) -> McpOAuthToken | None:
-        """Return stored OAuth tokens for *(user_id, mcp_name)*."""
-        await self.ensure_tables()
-        async with await psycopg.AsyncConnection.connect(
-            self._uri, row_factory=dict_row
-        ) as conn:
-            cur = await conn.execute(
-                "SELECT * FROM mcp_oauth_tokens WHERE user_id = %s AND mcp_name = %s",
-                (user_id, mcp_name),
+        """Return stored OAuth tokens for *(user_id, mcp_name)* from Redis."""
+        raw = await asyncio.to_thread(cache_get, self._token_key(user_id, mcp_name))
+        if raw is None:
+            return None
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.error(
+                "Corrupt MCP OAuth token payload for user '%s' MCP '%s'",
+                user_id,
+                mcp_name,
             )
-            row = await cur.fetchone()
-            if row is None:
-                return None
-            return McpOAuthToken(
-                user_id=row["user_id"],
-                mcp_name=row["mcp_name"],
-                access_token=decrypt_secret(row["access_token"]) or "",
-                refresh_token=decrypt_secret(row["refresh_token"]),
-                expires_at=row["expires_at"],
-                scopes=list(row["scopes"]) if row["scopes"] else None,
-                updated_at=row["updated_at"],
+            return None
+        if not isinstance(payload, dict):
+            logger.error(
+                "Invalid MCP OAuth token payload type for user '%s' MCP '%s'",
+                user_id,
+                mcp_name,
             )
+            return None
+        return self._payload_to_token(user_id, mcp_name, payload)
 
     async def upsert_token(
         self,
@@ -218,35 +246,16 @@ class McpTokenStore:
         expires_at: datetime | None = None,
         scopes: list[str] | None = None,
     ) -> McpOAuthToken:
-        """Insert or update OAuth tokens for *(user_id, mcp_name)*."""
-        await self.ensure_tables()
-        enc_access = encrypt_secret(access_token)
-        enc_refresh = encrypt_secret(refresh_token)
-        async with await psycopg.AsyncConnection.connect(self._uri) as conn:
-            await conn.execute(
-                """
-                INSERT INTO mcp_oauth_tokens (
-                    user_id, mcp_name, access_token, refresh_token,
-                    expires_at, scopes, updated_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, now())
-                ON CONFLICT (user_id, mcp_name) DO UPDATE SET
-                    access_token = EXCLUDED.access_token,
-                    refresh_token = EXCLUDED.refresh_token,
-                    expires_at = EXCLUDED.expires_at,
-                    scopes = EXCLUDED.scopes,
-                    updated_at = now()
-                """,
-                (
-                    user_id,
-                    mcp_name,
-                    enc_access,
-                    enc_refresh,
-                    expires_at,
-                    scopes,
-                ),
+        """Insert or update OAuth tokens for *(user_id, mcp_name)* in Redis."""
+        payload = self._token_to_payload(
+            access_token, refresh_token, expires_at, scopes
+        )
+        key = self._token_key(user_id, mcp_name)
+        stored = await asyncio.to_thread(cache_set_persistent, key, json.dumps(payload))
+        if not stored:
+            raise RuntimeError(
+                f"Failed to persist MCP OAuth token for user '{user_id}' MCP '{mcp_name}'"
             )
-            await conn.commit()
         return McpOAuthToken(
             user_id=user_id,
             mcp_name=mcp_name,
@@ -254,7 +263,12 @@ class McpTokenStore:
             refresh_token=refresh_token,
             expires_at=expires_at,
             scopes=scopes,
+            updated_at=self._deserialize_datetime(payload["updated_at"]),
         )
+
+    async def delete_token(self, user_id: str, mcp_name: str) -> bool:
+        """Delete stored OAuth tokens for *(user_id, mcp_name)* from Redis."""
+        return await asyncio.to_thread(cache_delete, self._token_key(user_id, mcp_name))
 
     @staticmethod
     def expires_at_from_token_response(data: dict[str, Any]) -> datetime | None:

@@ -56,7 +56,7 @@ def reset_mcp_crypto_cache() -> None:
 
 
 def encrypt_secret(plaintext: str | None) -> str | None:
-    """Encrypt a secret value for Postgres storage."""
+    """Encrypt a secret value for Redis/Postgres storage."""
     if plaintext is None:
         return None
     return cast(str, _get_fernet_primary().encrypt(plaintext.encode()).decode())

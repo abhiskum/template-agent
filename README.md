@@ -77,7 +77,7 @@ orchestrator's MCP list.
 | `auth_mode` | When to use | How credentials work |
 |---|---|---|
 | `sso` (default) | MCP accepts the same SSO token as the agent (e.g. RH-SSO) | User's request Bearer token is forwarded to the MCP on every tool call |
-| `oauth` | MCP has a pre-registered OAuth client | User connects once via the chat UI; per-user tokens are stored in Postgres |
+| `oauth` | MCP has a pre-registered OAuth client | User connects once via the chat UI; per-user tokens are stored encrypted in Redis |
 | `dcr` | MCP supports OAuth Dynamic Client Registration | Agent registers a client at startup/connect, then same per-user OAuth flow as `oauth` |
 
 Set `"auth": false` to call an MCP without an `Authorization` header (public/local servers only).
@@ -252,7 +252,7 @@ tools:
 When using `auth_mode: "oauth"` or `"dcr"`:
 
 ```bash
-# Fernet key for encrypting tokens at rest in Postgres (required)
+# Fernet key for encrypting tokens at rest in Redis (required)
 # Generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 MCP_TOKEN_ENCRYPTION_KEY=...
 
@@ -267,10 +267,10 @@ MCP_TOKEN_ENCRYPTION_KEY=...
 # Local dev: http://localhost:5002  |  Production: https://your-agent.example.com
 AGENT_PUBLIC_BASE_URL=http://localhost:5002
 
-# Redis stores short-lived OAuth PKCE state during the connect flow (required)
+# Redis stores encrypted per-user OAuth tokens and short-lived PKCE state (required)
 REDIS_URL=redis://localhost:6379/0
 
-# Postgres stores per-user tokens and DCR client records (required)
+# Postgres stores DCR client records (required for auth_mode: dcr)
 POSTGRES_HOST=...
 ```
 
@@ -281,10 +281,10 @@ Do not use `http://` outside local development — tokens can be intercepted in 
 
 ### Encryption key rotation
 
-`MCP_TOKEN_ENCRYPTION_KEY` encrypts OAuth access/refresh tokens and DCR client secrets
-in Postgres (`mcp_oauth_tokens`, `mcp_oauth_clients`). The agent supports **dual-key
-decryption** so you can rotate without wiping the database or forcing every user to
-re-authenticate immediately.
+`MCP_TOKEN_ENCRYPTION_KEY` encrypts OAuth access/refresh tokens in Redis and DCR
+client secrets in Postgres (`mcp_oauth_clients`). The agent supports **dual-key
+decryption** so you can rotate without wiping stored credentials or forcing every
+user to re-authenticate immediately.
 
 **Planned rotation (zero-downtime):**
 
@@ -294,8 +294,8 @@ re-authenticate immediately.
 3. Rolling-restart all agent pods. New writes use the new key; reads succeed for
    ciphertext encrypted with either key.
 4. Wait for natural re-encryption: tokens are rewritten with the new key on OAuth
-   callback, token refresh, or reconnect. DCR `client_secret` values are rewritten
-   on the next `upsert_client`.
+   callback or token refresh. DCR `client_secret` values are rewritten on the next
+   `upsert_client`.
 5. When all rows have been touched (or after a maintenance window), remove
    `MCP_TOKEN_ENCRYPTION_KEY_PREVIOUS` and restart again.
 
@@ -303,11 +303,12 @@ re-authenticate immediately.
 
 1. Generate a new Fernet key and set it as `MCP_TOKEN_ENCRYPTION_KEY`.
 2. Delete stored credentials so nothing encrypted with the leaked key remains:
-   `DELETE FROM mcp_oauth_tokens; DELETE FROM mcp_oauth_clients;`
+   - Redis tokens: `redis-cli --scan --pattern 'aegra:mcp_oauth_token:*' | xargs redis-cli DEL`
+   - DCR clients: `DELETE FROM mcp_oauth_clients;`
 3. Restart agent pods. Users must reconnect OAuth/DCR MCPs; DCR servers re-register
    on next connect.
 4. Revoke OAuth clients at the identity provider if the old key exposure could have
-   leaked plaintext tokens from Postgres backups or dumps.
+   leaked plaintext tokens from Redis dumps or Postgres backups.
 
 If decryption fails (wrong keys or corrupt data), the agent logs an error and the
 affected MCP call returns an authorization error until the user reconnects.
