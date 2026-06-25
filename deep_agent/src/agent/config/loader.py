@@ -305,7 +305,6 @@ class AgentConfig:
         for field in (
             "authorization_endpoint",
             "token_endpoint",
-            "redirect_uri",
         ):
             if not oauth.get(field):
                 logger.error(
@@ -315,9 +314,23 @@ class AgentConfig:
                     auth_mode,
                 )
 
+        if oauth.get("redirect_uri"):
+            logger.warning(
+                "MCP server '%s': oauth.redirect_uri in mcp.json is ignored — "
+                "redirect URI is derived from AGENT_PUBLIC_BASE_URL",
+                name,
+            )
+
         if auth_mode == "oauth" and not oauth.get("client_id"):
             logger.error(
                 "MCP server '%s': oauth.client_id is required for auth_mode 'oauth'",
+                name,
+            )
+
+        if oauth.get("client_secret"):
+            logger.warning(
+                "MCP server '%s': oauth.client_secret in mcp.json is insecure — "
+                "use oauth.client_secret_env with an environment variable name instead",
                 name,
             )
 

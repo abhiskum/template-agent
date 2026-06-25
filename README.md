@@ -60,6 +60,7 @@ Client examples (Streamlit, Python async) are in [`examples/`](./examples/).
 | `SSL_KEYFILE` | — | No |
 | `SSL_CERTFILE` | — | No |
 | `MCP_TOKEN_ENCRYPTION_KEY` | — | Yes (for `oauth` / `dcr` MCPs) |
+| `MCP_TOKEN_ENCRYPTION_KEY_PREVIOUS` | — | No (decrypt-only; set during key rotation) |
 | `AGENT_PUBLIC_BASE_URL` | `http://localhost:{AGENT_PORT}` | Yes (for `oauth` / `dcr` in production) |
 
 Runtime configuration (cache TTLs, memory settings, agent identity) is in `config/agent/runtime/agent.yaml`.
@@ -123,8 +124,8 @@ Use when the MCP server validates the same SSO access token as the agent (token 
 
 #### OAuth example (pre-registered client)
 
-Use when you already have a `client_id` (and optionally `client_secret`) from the MCP
-provider. Users connect through the chat UI before tools are available.
+Use when you already have a `client_id` (and optionally a client secret via environment
+variable) from the MCP provider. Users connect through the chat UI before tools are available.
 
 ```json
 {
@@ -139,16 +140,18 @@ provider. Users connect through the chat UI before tools are available.
       "timeout": 30,
       "oauth": {
         "client_id": "your-client-id",
-        "client_secret": "your-client-secret",
+        "client_secret_env": "MY_OAUTH_MCP_CLIENT_SECRET",
         "authorization_endpoint": "https://auth.example.com/authorize",
         "token_endpoint": "https://auth.example.com/token",
-        "redirect_uri": "http://localhost:5002/mcp/oauth/callback",
         "scopes": ["read", "write"]
       }
     }
   }
 }
 ```
+
+The OAuth redirect URI is derived at runtime from `AGENT_PUBLIC_BASE_URL` as
+`{AGENT_PUBLIC_BASE_URL}/mcp/oauth/callback` — do not set `redirect_uri` in `mcp.json`.
 
 **Required `oauth` fields for `auth_mode: "oauth"`:**
 
@@ -157,9 +160,16 @@ provider. Users connect through the chat UI before tools are available.
 | `client_id` | **Yes** | Pre-registered OAuth client ID |
 | `authorization_endpoint` | **Yes** | Authorization URL |
 | `token_endpoint` | **Yes** | Token exchange URL |
-| `redirect_uri` | **Yes** | Must be `{AGENT_PUBLIC_BASE_URL}/mcp/oauth/callback` |
-| `client_secret` | No | Client secret (if the provider issued one) |
+| `client_secret_env` | No | Name of an environment variable holding the client secret (preferred) |
 | `scopes` | No | OAuth scopes (array of strings) |
+
+**Security:** Never put `client_secret` in `mcp.json` — it is version-controlled and
+easy to leak. Use `client_secret_env` and set the secret in `.env` or your secret
+manager. Inline `client_secret` in config still works but logs a deprecation warning.
+
+**HTTPS:** Set `AGENT_PUBLIC_BASE_URL` to `https://…` in production. Use
+`http://localhost:{AGENT_PORT}` only for local development; authorization codes and
+tokens can be intercepted when OAuth callbacks use plain HTTP.
 
 #### DCR example (dynamic client registration)
 
@@ -182,7 +192,6 @@ Use when the MCP provider exposes a registration endpoint (e.g. Atlassian MCP, l
         "authorization_endpoint": "https://mcp.atlassian.com/v1/authorize",
         "token_endpoint": "https://cf.mcp.atlassian.com/v1/token",
         "registration_endpoint": "https://cf.mcp.atlassian.com/v1/register",
-        "redirect_uri": "http://localhost:5002/mcp/oauth/callback",
         "scopes": ["jira:read"]
       }
     }
@@ -197,7 +206,6 @@ Use when the MCP provider exposes a registration endpoint (e.g. Atlassian MCP, l
 | `authorization_endpoint` | **Yes** | Authorization URL |
 | `token_endpoint` | **Yes** | Token exchange and refresh URL |
 | `registration_endpoint` | **Yes** | DCR registration URL |
-| `redirect_uri` | **Yes** | Must be `{AGENT_PUBLIC_BASE_URL}/mcp/oauth/callback` |
 | `scopes` | No | OAuth scopes requested at registration and authorize time |
 
 `client_id` and `client_secret` are **not** set in config — they are created at runtime
@@ -248,8 +256,15 @@ When using `auth_mode: "oauth"` or `"dcr"`:
 # Generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 MCP_TOKEN_ENCRYPTION_KEY=...
 
-# Public URL where the agent is reachable (used in redirect_uri and connect URLs)
-# Must match oauth.redirect_uri host in mcp.json
+# Optional previous key during rotation (decrypt-only; see "Encryption key rotation" below)
+# MCP_TOKEN_ENCRYPTION_KEY_PREVIOUS=...
+
+# Per-MCP OAuth client secret (auth_mode: oauth — set in .env, referenced via
+# oauth.client_secret_env in mcp.json; never commit real secrets in mcp.json)
+# MY_OAUTH_MCP_CLIENT_SECRET=your-client-secret
+
+# Public URL where the agent is reachable (OAuth redirect URI and connect URLs)
+# Local dev: http://localhost:5002  |  Production: https://your-agent.example.com
 AGENT_PUBLIC_BASE_URL=http://localhost:5002
 
 # Redis stores short-lived OAuth PKCE state during the connect flow (required)
@@ -260,8 +275,42 @@ POSTGRES_HOST=...
 ```
 
 In production behind a gateway or ingress, set `AGENT_PUBLIC_BASE_URL` to the
-externally reachable agent URL and update every `oauth.redirect_uri` in `mcp.json`
-to `{AGENT_PUBLIC_BASE_URL}/mcp/oauth/callback`.
+externally reachable **HTTPS** URL (e.g. `https://agent.example.com`). The OAuth
+redirect URI is derived automatically as `{AGENT_PUBLIC_BASE_URL}/mcp/oauth/callback`.
+Do not use `http://` outside local development — tokens can be intercepted in transit.
+
+### Encryption key rotation
+
+`MCP_TOKEN_ENCRYPTION_KEY` encrypts OAuth access/refresh tokens and DCR client secrets
+in Postgres (`mcp_oauth_tokens`, `mcp_oauth_clients`). The agent supports **dual-key
+decryption** so you can rotate without wiping the database or forcing every user to
+re-authenticate immediately.
+
+**Planned rotation (zero-downtime):**
+
+1. Generate a new Fernet key.
+2. Set `MCP_TOKEN_ENCRYPTION_KEY_PREVIOUS` to the **current** key and
+   `MCP_TOKEN_ENCRYPTION_KEY` to the **new** key.
+3. Rolling-restart all agent pods. New writes use the new key; reads succeed for
+   ciphertext encrypted with either key.
+4. Wait for natural re-encryption: tokens are rewritten with the new key on OAuth
+   callback, token refresh, or reconnect. DCR `client_secret` values are rewritten
+   on the next `upsert_client`.
+5. When all rows have been touched (or after a maintenance window), remove
+   `MCP_TOKEN_ENCRYPTION_KEY_PREVIOUS` and restart again.
+
+**Emergency rotation (key compromised):**
+
+1. Generate a new Fernet key and set it as `MCP_TOKEN_ENCRYPTION_KEY`.
+2. Delete stored credentials so nothing encrypted with the leaked key remains:
+   `DELETE FROM mcp_oauth_tokens; DELETE FROM mcp_oauth_clients;`
+3. Restart agent pods. Users must reconnect OAuth/DCR MCPs; DCR servers re-register
+   on next connect.
+4. Revoke OAuth clients at the identity provider if the old key exposure could have
+   leaked plaintext tokens from Postgres backups or dumps.
+
+If decryption fails (wrong keys or corrupt data), the agent logs an error and the
+affected MCP call returns an authorization error until the user reconnects.
 
 ### OAuth HTTP endpoints
 

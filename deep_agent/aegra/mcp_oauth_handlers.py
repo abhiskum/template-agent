@@ -10,11 +10,19 @@ from typing import Any
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from deep_agent.aegra.mcp import mcp_httpx_verify
-from deep_agent.aegra.mcp_auth import get_mcp_credential_resolver
+from deep_agent.aegra.mcp_auth import (
+    get_mcp_credential_resolver,
+    resolve_oauth_client_secret,
+)
+from deep_agent.aegra.mcp_oauth_scopes import (
+    parse_token_scopes,
+    requested_scopes,
+    validate_granted_scopes,
+)
 from deep_agent.aegra.mcp_token_store import McpTokenStore
 from deep_agent.aegra.redis import cache_get, cache_set
 from deep_agent.src.agent.config import agent_config
@@ -23,7 +31,13 @@ from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
 
-_OAUTH_STATE_TTL_SECONDS = 600
+_OAUTH_STATE_TTL_SECONDS = 300
+
+
+def _callback_redirect_uri(request: Request) -> str:
+    """Reconstruct the OAuth callback URL (scheme + host + path, no query)."""
+    url = request.url
+    return f"{url.scheme}://{url.netloc}{url.path}"
 
 
 def _pkce_pair() -> tuple[str, str]:
@@ -57,7 +71,7 @@ async def _register_dcr_client(
 
     scopes = oauth_cfg.get("scopes") or []
     scope_str = " ".join(scopes) if isinstance(scopes, list) else str(scopes)
-    redirect_uri = oauth_cfg["redirect_uri"]
+    redirect_uri = settings.oauth_callback_url
 
     body = {
         "client_name": f"template-agent-{mcp_name}",
@@ -108,12 +122,14 @@ async def handle_mcp_connect(user_id: str, mcp_name: str) -> dict[str, str]:
         )
 
     oauth_cfg = server_cfg.get("oauth") or {}
-    for field in ("authorization_endpoint", "token_endpoint", "redirect_uri"):
+    for field in ("authorization_endpoint", "token_endpoint"):
         if not oauth_cfg.get(field):
             raise HTTPException(
                 status_code=400,
                 detail=f"MCP '{mcp_name}' missing oauth.{field}",
             )
+
+    redirect_uri = settings.oauth_callback_url
 
     store = McpTokenStore(settings.database_uri)
     if auth_mode == "dcr":
@@ -147,7 +163,7 @@ async def handle_mcp_connect(user_id: str, mcp_name: str) -> dict[str, str]:
     params = {
         "response_type": "code",
         "client_id": client_id,
-        "redirect_uri": oauth_cfg["redirect_uri"],
+        "redirect_uri": redirect_uri,
         "scope": scope_str,
         "state": state,
         "code_challenge": code_challenge,
@@ -158,7 +174,7 @@ async def handle_mcp_connect(user_id: str, mcp_name: str) -> dict[str, str]:
 
 
 async def handle_mcp_oauth_callback(
-    code: str | None, state: str | None
+    code: str | None, state: str | None, request: Request
 ) -> HTMLResponse:
     """Exchange authorization code and persist tokens, then notify the opener."""
     if not code or not state:
@@ -188,18 +204,31 @@ async def handle_mcp_oauth_callback(
     server_cfg = _get_mcp_server_config(mcp_name)
     oauth_cfg = server_cfg.get("oauth") or {}
     token_endpoint = oauth_cfg.get("token_endpoint")
-    redirect_uri = oauth_cfg.get("redirect_uri")
-    if not token_endpoint or not redirect_uri:
+    redirect_uri = settings.oauth_callback_url
+    if not token_endpoint:
         return HTMLResponse(
             _callback_html(error="MCP OAuth is not configured"),
             status_code=500,
+        )
+
+    callback_uri = _callback_redirect_uri(request)
+    if callback_uri != redirect_uri:
+        logger.warning(
+            "OAuth callback redirect_uri mismatch for '%s': expected %r, got %r",
+            mcp_name,
+            redirect_uri,
+            callback_uri,
+        )
+        return HTMLResponse(
+            _callback_html(error="OAuth redirect URI mismatch"),
+            status_code=400,
         )
 
     store = McpTokenStore(settings.database_uri)
     auth_mode = server_cfg.get("auth_mode", "sso")
     if auth_mode == "oauth":
         client_id = oauth_cfg.get("client_id")
-        client_secret = oauth_cfg.get("client_secret")
+        client_secret = resolve_oauth_client_secret(oauth_cfg, mcp_name)
     else:
         client = await store.get_client(mcp_name)
         client_id = client.client_id if client else None
@@ -226,10 +255,10 @@ async def handle_mcp_oauth_callback(
             resp = await client.post(token_endpoint, data=data, timeout=30)
             resp.raise_for_status()
             body: dict[str, Any] = resp.json()
-    except Exception as exc:
+    except Exception:
         logger.error("OAuth token exchange failed for '%s'", mcp_name, exc_info=True)
         return HTMLResponse(
-            _callback_html(error=f"Token exchange failed: {exc}"),
+            _callback_html(error="Authentication failed. Please try again."),
             status_code=502,
         )
 
@@ -241,8 +270,19 @@ async def handle_mcp_oauth_callback(
         )
 
     expires_at = McpTokenStore.expires_at_from_token_response(body)
-    scope_raw = body.get("scope")
-    scopes = scope_raw.split() if isinstance(scope_raw, str) and scope_raw else None
+    requested_scope_list = requested_scopes(oauth_cfg)
+    scopes = validate_granted_scopes(
+        parse_token_scopes(body),
+        requested_scope_list,
+        mcp_name,
+    )
+    if scopes is None and requested_scope_list:
+        return HTMLResponse(
+            _callback_html(
+                error="Authentication failed. Required permissions were not granted."
+            ),
+            status_code=502,
+        )
 
     await store.upsert_token(
         user_id=user_id,
@@ -290,7 +330,7 @@ def _callback_html(
 <p>Connected. You can close this window.</p>
 <script>
   if (window.opener) {{
-    window.opener.postMessage({{ type: "mcp_oauth_done", mcp_name: {safe_name} }}, "*");
+    window.opener.postMessage({{ type: "mcp_oauth_done", mcp_name: {safe_name} }}, window.location.origin);
   }}
   window.close();
 </script>

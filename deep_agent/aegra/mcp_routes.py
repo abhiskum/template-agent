@@ -41,13 +41,14 @@ async def mcp_connect(mcp_name: str, request: Request) -> JSONResponse:
 
 @router.get("/mcp/oauth/callback")
 async def mcp_oauth_callback(
+    request: Request,
     code: str | None = None,
     state: str | None = None,
 ) -> HTMLResponse:
     """Handle the OAuth redirect — exchange code and notify the UI opener."""
     from deep_agent.aegra.mcp_oauth_handlers import handle_mcp_oauth_callback
 
-    return await handle_mcp_oauth_callback(code, state)
+    return await handle_mcp_oauth_callback(code, state, request)
 
 
 @router.get("/mcp/{mcp_name}/status")

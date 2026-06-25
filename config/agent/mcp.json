@@ -21,8 +21,7 @@
                 "authorization_endpoint": "http://localhost:5001/auth/authorize",
                 "token_endpoint": "http://localhost:5001/auth/token",
                 "registration_endpoint": "http://localhost:5001/auth/register",
-                "scopes": ["email", "openid", "profile", "session:role-any"],
-                "redirect_uri": "http://localhost:5002/mcp/oauth/callback"
+                "scopes": ["email", "openid", "profile", "session:role-any"]
             }
         }
     }

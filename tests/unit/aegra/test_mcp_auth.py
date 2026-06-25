@@ -51,8 +51,7 @@ Test prompt.
                   "auth_mode": "oauth",
                   "oauth": {
                     "authorization_endpoint": "https://as.example.com/authorize",
-                    "token_endpoint": "https://as.example.com/token",
-                    "redirect_uri": "https://agent.example.com/mcp/oauth/callback"
+                    "token_endpoint": "https://as.example.com/token"
                   }
                 }
               }
@@ -76,8 +75,7 @@ Test prompt.
                   "auth_mode": "dcr",
                   "oauth": {
                     "authorization_endpoint": "https://as.example.com/authorize",
-                    "token_endpoint": "https://as.example.com/token",
-                    "redirect_uri": "https://agent.example.com/mcp/oauth/callback"
+                    "token_endpoint": "https://as.example.com/token"
                   }
                 }
               }

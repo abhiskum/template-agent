@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -14,7 +16,13 @@ from deep_agent.aegra.mcp import (
     mcp_httpx_verify,
     refresh_access_token,
 )
+from deep_agent.aegra.mcp_oauth_scopes import (
+    parse_token_scopes,
+    requested_scopes,
+    validate_granted_scopes,
+)
 from deep_agent.aegra.mcp_token_store import McpOAuthToken, McpTokenStore
+from deep_agent.aegra.redis import distributed_lock
 from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
@@ -22,6 +30,36 @@ logger = get_python_logger()
 
 _RESOLVED_TOKEN_TTL_SECONDS = 30.0
 _TOKEN_EXPIRY_BUFFER_SECONDS = 30.0
+_TOKEN_REFRESH_LOCK_TTL_SECONDS = 30
+_TOKEN_REFRESH_LOCK_WAIT_SECONDS = 10.0
+_TOKEN_REFRESH_WAIT_POLL_SECONDS = 0.1
+_TOKEN_REFRESH_WAIT_ATTEMPTS = 50
+
+
+def resolve_oauth_client_secret(oauth_cfg: dict[str, Any], mcp_name: str) -> str | None:
+    """Resolve OAuth client secret from env (preferred) or legacy inline config."""
+    env_var = oauth_cfg.get("client_secret_env")
+    if env_var:
+        value = os.environ.get(env_var)
+        if not value:
+            logger.error(
+                "MCP '%s': environment variable %r is not set (oauth.client_secret_env)",
+                mcp_name,
+                env_var,
+            )
+            return None
+        return value
+
+    inline = oauth_cfg.get("client_secret")
+    if inline:
+        logger.warning(
+            "MCP '%s': oauth.client_secret in mcp.json is insecure — "
+            "set oauth.client_secret_env to an environment variable name instead",
+            mcp_name,
+        )
+        return str(inline)
+
+    return None
 
 
 class NeedsAuthorization(Exception):
@@ -110,13 +148,59 @@ class McpCredentialResolver:
         if self._token_valid(stored):
             return stored.access_token
 
-        if stored.refresh_token:
+        if not stored.refresh_token:
+            raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
+
+        lock_name = f"mcp_token_refresh:{user_id}:{mcp_name}"
+        async with distributed_lock(
+            lock_name,
+            ttl_seconds=_TOKEN_REFRESH_LOCK_TTL_SECONDS,
+            wait_seconds=_TOKEN_REFRESH_LOCK_WAIT_SECONDS,
+        ) as lock_state:
+            stored = await self._store.get_token(user_id, mcp_name)
+            if stored is None:
+                raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
+            if self._token_valid(stored):
+                return stored.access_token
+            if not stored.refresh_token:
+                raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
+
+            if lock_state == "timeout":
+                refreshed_by_peer = await self._wait_for_refreshed_token(
+                    user_id, mcp_name
+                )
+                if refreshed_by_peer:
+                    return refreshed_by_peer
+                raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
+
+            if lock_state == "no_redis":
+                logger.warning(
+                    "Redis unavailable; refreshing MCP token for '%s' without lock",
+                    mcp_name,
+                )
+
             refreshed = await self._refresh_mcp_token(stored, server_cfg)
             if refreshed:
                 self.invalidate_cache(user_id, mcp_name)
                 return refreshed
 
         raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
+
+    async def _wait_for_refreshed_token(
+        self, user_id: str, mcp_name: str
+    ) -> str | None:
+        """Poll storage while another request holds the refresh lock."""
+        for _ in range(_TOKEN_REFRESH_WAIT_ATTEMPTS):
+            await asyncio.sleep(_TOKEN_REFRESH_WAIT_POLL_SECONDS)
+            stored = await self._store.get_token(user_id, mcp_name)
+            if stored is not None and self._token_valid(stored):
+                return stored.access_token
+        logger.error(
+            "Timed out waiting for MCP token refresh for '%s' user '%s'",
+            mcp_name,
+            user_id,
+        )
+        return None
 
     @staticmethod
     def _token_valid(token: McpOAuthToken) -> bool:
@@ -180,12 +264,20 @@ class McpCredentialResolver:
 
         new_refresh = body.get("refresh_token", stored.refresh_token)
         expires_at = McpTokenStore.expires_at_from_token_response(body)
-        scope_raw = body.get("scope")
-        scopes = (
-            scope_raw.split()
-            if isinstance(scope_raw, str) and scope_raw
-            else stored.scopes
-        )
+        requested_scope_list = requested_scopes(oauth_cfg)
+        parsed_scopes = parse_token_scopes(body)
+        if parsed_scopes is not None:
+            scopes = validate_granted_scopes(
+                parsed_scopes, requested_scope_list, stored.mcp_name
+            )
+            if scopes is None and requested_scope_list:
+                logger.error(
+                    "MCP token refresh for '%s' returned insufficient scopes",
+                    stored.mcp_name,
+                )
+                return None
+        else:
+            scopes = stored.scopes
 
         await self._store.upsert_token(
             user_id=stored.user_id,
@@ -205,7 +297,9 @@ class McpCredentialResolver:
         oauth_cfg = server_cfg.get("oauth") or {}
 
         if auth_mode == "oauth":
-            return oauth_cfg.get("client_id"), oauth_cfg.get("client_secret")
+            return oauth_cfg.get("client_id"), resolve_oauth_client_secret(
+                oauth_cfg, mcp_name
+            )
 
         if auth_mode == "dcr":
             client = await self._store.get_client(mcp_name)

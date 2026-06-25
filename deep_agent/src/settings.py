@@ -10,6 +10,7 @@ Hierarchy (highest wins):
 """
 
 from typing import Optional
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from pydantic import Field
@@ -19,6 +20,8 @@ from deep_agent.src.exceptions import AppException, ErrorCodes
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
+
+_DEV_PUBLIC_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 try:
     load_dotenv()
@@ -112,6 +115,7 @@ class Settings(BaseSettings):
 
     # ── MCP OAuth ─────────────────────────────────────────────────────
     MCP_TOKEN_ENCRYPTION_KEY: Optional[str] = Field(default=None)
+    MCP_TOKEN_ENCRYPTION_KEY_PREVIOUS: Optional[str] = Field(default=None)
     AGENT_PUBLIC_BASE_URL: Optional[str] = Field(default=None)
 
     # ── Derived ───────────────────────────────────────────────────────
@@ -122,6 +126,17 @@ class Settings(BaseSettings):
         if self.AGENT_PUBLIC_BASE_URL:
             return self.AGENT_PUBLIC_BASE_URL.rstrip("/")
         return f"http://localhost:{self.AGENT_PORT}"
+
+    @property
+    def is_dev_public_url(self) -> bool:
+        """True when the public base URL is an allowed local HTTP dev endpoint."""
+        parsed = urlparse(self.agent_public_base_url)
+        return parsed.scheme == "http" and parsed.hostname in _DEV_PUBLIC_HOSTS
+
+    @property
+    def oauth_callback_url(self) -> str:
+        """Canonical OAuth redirect URI derived from AGENT_PUBLIC_BASE_URL."""
+        return f"{self.agent_public_base_url}/mcp/oauth/callback"
 
     @property
     def database_uri(self) -> str:
@@ -146,6 +161,15 @@ def validate_config(settings: Settings) -> None:
             f"PYTHON_LOG_LEVEL must be one of {valid_log_levels}, got {settings.PYTHON_LOG_LEVEL}",
             ErrorCodes.CONFIGURATION_VALIDATION_ERROR,
         )
+
+    if settings.AGENT_PUBLIC_BASE_URL and not settings.is_dev_public_url:
+        parsed = urlparse(settings.AGENT_PUBLIC_BASE_URL)
+        if parsed.scheme != "https":
+            raise AppException(
+                "AGENT_PUBLIC_BASE_URL must use https:// in production "
+                "(http:// is permitted only for localhost, 127.0.0.1, or ::1)",
+                ErrorCodes.CONFIGURATION_VALIDATION_ERROR,
+            )
 
 
 settings = Settings()
