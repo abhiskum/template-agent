@@ -821,6 +821,7 @@ class TestCreateAuthPlaceholderTool:
             with pytest.raises(NeedsAuthorization) as exc_info:
                 await tool.coroutine(query="list my tickets")
         assert exc_info.value.mcp_name == "jira-mcp"
+        assert exc_info.value.connect_url == "http://localhost/mcp/jira-mcp/connect"
         mock_resolver.resolve.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -850,5 +851,6 @@ class TestCreateAuthPlaceholderTool:
             ),
         ):
             mock_ctx.get.return_value = "user-1"
-            with pytest.raises(NeedsAuthorization):
+            with pytest.raises(NeedsAuthorization) as exc_info:
                 await tool.coroutine(query="list my tickets")
+        assert exc_info.value.connect_url == "http://localhost/mcp/jira-mcp/connect"
