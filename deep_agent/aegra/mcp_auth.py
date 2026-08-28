@@ -350,6 +350,21 @@ class McpCredentialResolver:
         try:
             async with httpx.AsyncClient(verify=mcp_httpx_verify(server_cfg)) as client:
                 resp = await client.post(token_endpoint, data=data, timeout=30)
+                if resp.status_code in (401, 403) or (
+                    resp.status_code == 400 and "invalid_client" in resp.text.lower()
+                ):
+                    logger.warning(
+                        "MCP token refresh rejected for '%s' (status %s) — "
+                        "deleting stale DCR client so next connect re-registers",
+                        stored.mcp_name,
+                        resp.status_code,
+                    )
+                    auth_mode = server_cfg.get("auth_mode", "sso")
+                    if auth_mode == "dcr":
+                        await self._store.delete_client(
+                            stored.agent_name, stored.mcp_name
+                        )
+                    return None
                 resp.raise_for_status()
                 body: dict[str, Any] = resp.json()
         except Exception:

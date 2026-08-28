@@ -123,6 +123,45 @@ async def _register_dcr_client(
     return client_id, client_secret
 
 
+async def _validate_dcr_client(
+    client_id: str,
+    oauth_cfg: dict[str, Any],
+    server_cfg: dict[str, Any],
+) -> bool:
+    """Check if a DCR client_id is still accepted by the MCP server.
+
+    Sends a lightweight GET to the authorization_endpoint with the client_id.
+    Stateless MCP servers reject expired signed client_ids immediately.
+    Returns False if the server rejects the client_id, True otherwise.
+    """
+    auth_endpoint = oauth_cfg.get("authorization_endpoint")
+    if not auth_endpoint:
+        return True
+
+    try:
+        async with httpx.AsyncClient(
+            verify=mcp_httpx_verify(server_cfg)
+        ) as http_client:
+            resp = await http_client.get(
+                auth_endpoint,
+                params={
+                    "response_type": "code",
+                    "client_id": client_id,
+                    "redirect_uri": settings.oauth_callback_url,
+                },
+                follow_redirects=False,
+                timeout=10,
+            )
+            if resp.status_code in (302, 200):
+                return True
+            if "invalid_client" in resp.text.lower():
+                return False
+            return True
+    except Exception:
+        logger.debug("DCR client validation probe failed", exc_info=True)
+        return True
+
+
 async def handle_mcp_connect(
     user_id: str, mcp_name: str, *, caller_origin: str | None = None
 ) -> dict[str, str]:
@@ -155,6 +194,17 @@ async def handle_mcp_connect(
     store = McpTokenStore(settings.database_uri)
     if auth_mode == "dcr":
         client = await store.get_client(current_agent_name, mcp_name)
+        if client is not None:
+            is_valid = await _validate_dcr_client(
+                client.client_id, oauth_cfg, server_cfg
+            )
+            if not is_valid:
+                logger.warning(
+                    "DCR client_id expired/rejected for '%s' — re-registering",
+                    mcp_name,
+                )
+                await store.delete_client(current_agent_name, mcp_name)
+                client = None
         if client is None:
             await _register_dcr_client(
                 current_agent_name, mcp_name, oauth_cfg, server_cfg
