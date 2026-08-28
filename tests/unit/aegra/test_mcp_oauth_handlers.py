@@ -481,3 +481,271 @@ class TestCallbackHtml:
         result = _callback_html(error='<script>alert("xss")</script>')
         assert "<script>" not in result
         assert "&lt;script&gt;" in result
+
+
+@pytest.mark.asyncio
+class TestValidateDcrClient:
+    """Tests for _validate_dcr_client helper."""
+
+    async def test_returns_true_on_302_redirect(self):
+        from deep_agent.aegra.mcp_oauth_handlers import _validate_dcr_client
+
+        mock_response = MagicMock()
+        mock_response.status_code = 302
+        mock_response.text = ""
+
+        mock_ctx = AsyncMock(get=AsyncMock(return_value=mock_response))
+
+        with (
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.httpx.AsyncClient"
+            ) as mock_client,
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.mcp_httpx_verify",
+                return_value=True,
+            ),
+            patch("deep_agent.aegra.mcp_oauth_handlers.settings") as mock_settings,
+        ):
+            mock_settings.oauth_callback_url = (
+                "https://agent.example.com/mcp/oauth/callback"
+            )
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await _validate_dcr_client(
+                "valid-client-id",
+                {"authorization_endpoint": "https://mcp.example.com/authorize"},
+                {"enabled": True},
+            )
+
+        assert result is True
+
+    async def test_returns_false_on_invalid_client_error(self):
+        from deep_agent.aegra.mcp_oauth_handlers import _validate_dcr_client
+
+        mock_response = MagicMock()
+        mock_response.status_code = 400
+        mock_response.text = (
+            '{"error": "invalid_client", "error_description": "client_id expired"}'
+        )
+
+        mock_ctx = AsyncMock(get=AsyncMock(return_value=mock_response))
+
+        with (
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.httpx.AsyncClient"
+            ) as mock_client,
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.mcp_httpx_verify",
+                return_value=True,
+            ),
+            patch("deep_agent.aegra.mcp_oauth_handlers.settings") as mock_settings,
+        ):
+            mock_settings.oauth_callback_url = (
+                "https://agent.example.com/mcp/oauth/callback"
+            )
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await _validate_dcr_client(
+                "expired-client-id",
+                {"authorization_endpoint": "https://mcp.example.com/authorize"},
+                {"enabled": True},
+            )
+
+        assert result is False
+
+    async def test_returns_true_when_no_authorization_endpoint(self):
+        from deep_agent.aegra.mcp_oauth_handlers import _validate_dcr_client
+
+        result = await _validate_dcr_client(
+            "some-client-id",
+            {},
+            {"enabled": True},
+        )
+        assert result is True
+
+    async def test_returns_true_on_network_error(self):
+        from deep_agent.aegra.mcp_oauth_handlers import _validate_dcr_client
+
+        mock_ctx = AsyncMock(get=AsyncMock(side_effect=Exception("connection refused")))
+
+        with (
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.httpx.AsyncClient"
+            ) as mock_client,
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.mcp_httpx_verify",
+                return_value=True,
+            ),
+            patch("deep_agent.aegra.mcp_oauth_handlers.settings") as mock_settings,
+        ):
+            mock_settings.oauth_callback_url = (
+                "https://agent.example.com/mcp/oauth/callback"
+            )
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await _validate_dcr_client(
+                "some-client-id",
+                {"authorization_endpoint": "https://mcp.example.com/authorize"},
+                {"enabled": True},
+            )
+
+        assert result is True
+
+    async def test_returns_true_on_unknown_error_status(self):
+        from deep_agent.aegra.mcp_oauth_handlers import _validate_dcr_client
+
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+        mock_response.text = "Internal Server Error"
+
+        mock_ctx = AsyncMock(get=AsyncMock(return_value=mock_response))
+
+        with (
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.httpx.AsyncClient"
+            ) as mock_client,
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.mcp_httpx_verify",
+                return_value=True,
+            ),
+            patch("deep_agent.aegra.mcp_oauth_handlers.settings") as mock_settings,
+        ):
+            mock_settings.oauth_callback_url = (
+                "https://agent.example.com/mcp/oauth/callback"
+            )
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await _validate_dcr_client(
+                "some-client-id",
+                {"authorization_endpoint": "https://mcp.example.com/authorize"},
+                {"enabled": True},
+            )
+
+        assert result is True
+
+
+@pytest.mark.asyncio
+class TestHandleMcpConnectDcrValidation:
+    """Tests for handle_mcp_connect DCR client_id validation and re-registration."""
+
+    async def test_expired_client_triggers_reregistration(self):
+        from deep_agent.aegra.mcp_token_store import McpOAuthClient
+
+        existing_client = McpOAuthClient(
+            agent_name="test-agent",
+            mcp_name="dcr-mcp",
+            client_id="expired-cid",
+            client_secret="old-secret",
+        )
+        new_client = McpOAuthClient(
+            agent_name="test-agent",
+            mcp_name="dcr-mcp",
+            client_id="fresh-cid",
+            client_secret="new-secret",
+        )
+
+        server_cfg = {
+            "enabled": True,
+            "auth_mode": "dcr",
+            "oauth": {
+                "authorization_endpoint": "https://mcp.example.com/authorize",
+                "token_endpoint": "https://mcp.example.com/token",
+                "registration_endpoint": "https://mcp.example.com/register",
+            },
+        }
+
+        mock_store = MagicMock()
+        get_client_calls = [existing_client, new_client]
+        mock_store.get_client = AsyncMock(side_effect=get_client_calls)
+        mock_store.delete_client = AsyncMock()
+
+        with (
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers._get_mcp_server_config",
+                return_value=server_cfg,
+            ),
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers._validate_dcr_client",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers._register_dcr_client",
+                new=AsyncMock(return_value=("fresh-cid", "new-secret")),
+            ),
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.McpTokenStore",
+                return_value=mock_store,
+            ),
+            patch("deep_agent.aegra.mcp_oauth_handlers.settings") as mock_settings,
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.cache_set",
+                return_value=True,
+            ),
+        ):
+            mock_settings.oauth_callback_url = (
+                "https://agent.example.com/mcp/oauth/callback"
+            )
+            mock_settings.agent_deployment_id = "test-agent"
+
+            result = await handle_mcp_connect("user-1", "dcr-mcp")
+
+        assert "authorize_url" in result
+        mock_store.delete_client.assert_awaited_once_with("test-agent", "dcr-mcp")
+
+    async def test_valid_client_skips_reregistration(self):
+        from deep_agent.aegra.mcp_token_store import McpOAuthClient
+
+        existing_client = McpOAuthClient(
+            agent_name="test-agent",
+            mcp_name="dcr-mcp",
+            client_id="valid-cid",
+            client_secret="secret",
+        )
+
+        server_cfg = {
+            "enabled": True,
+            "auth_mode": "dcr",
+            "oauth": {
+                "authorization_endpoint": "https://mcp.example.com/authorize",
+                "token_endpoint": "https://mcp.example.com/token",
+                "registration_endpoint": "https://mcp.example.com/register",
+            },
+        }
+
+        mock_store = MagicMock()
+        mock_store.get_client = AsyncMock(return_value=existing_client)
+        mock_store.delete_client = AsyncMock()
+
+        with (
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers._get_mcp_server_config",
+                return_value=server_cfg,
+            ),
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers._validate_dcr_client",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.McpTokenStore",
+                return_value=mock_store,
+            ),
+            patch("deep_agent.aegra.mcp_oauth_handlers.settings") as mock_settings,
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.cache_set",
+                return_value=True,
+            ),
+        ):
+            mock_settings.oauth_callback_url = (
+                "https://agent.example.com/mcp/oauth/callback"
+            )
+            mock_settings.agent_deployment_id = "test-agent"
+
+            result = await handle_mcp_connect("user-1", "dcr-mcp")
+
+        assert "authorize_url" in result
+        assert "valid-cid" in result["authorize_url"]
+        mock_store.delete_client.assert_not_awaited()

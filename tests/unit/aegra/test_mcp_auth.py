@@ -466,3 +466,212 @@ class TestClientCredentialsGrant:
         call_kwargs = mock_ctx.post.call_args
         data = call_kwargs.kwargs.get("data", call_kwargs[1].get("data", {}))
         assert data["scope"] == "read write"
+
+
+@pytest.mark.asyncio
+class TestRefreshTokenInvalidClient:
+    """Tests for _refresh_mcp_token handling of invalid/expired DCR client_id."""
+
+    async def test_refresh_deletes_dcr_client_on_401(self):
+        store = AsyncMock()
+        store.delete_client = AsyncMock()
+        resolver = McpCredentialResolver(token_store=store)
+
+        stored = McpOAuthToken(
+            agent_name="test-agent",
+            user_id="user-1",
+            mcp_name="dcr-mcp",
+            access_token="old-access",
+            refresh_token="refresh-me",
+        )
+        server_cfg = {
+            "auth_mode": "dcr",
+            "oauth": {
+                "token_endpoint": "https://mcp.example.com/token",
+            },
+        }
+
+        mock_response = MagicMock()
+        mock_response.status_code = 401
+        mock_response.text = "Unauthorized"
+
+        with (
+            patch.object(
+                resolver,
+                "_resolve_client_credentials",
+                new=AsyncMock(return_value=("cid", "csecret")),
+            ),
+            patch("deep_agent.aegra.mcp_auth.httpx.AsyncClient") as mock_client,
+        ):
+            mock_ctx = AsyncMock(post=AsyncMock(return_value=mock_response))
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await resolver._refresh_mcp_token(stored, server_cfg)
+
+        assert result is None
+        store.delete_client.assert_awaited_once_with("test-agent", "dcr-mcp")
+
+    async def test_refresh_deletes_dcr_client_on_400_invalid_client(self):
+        store = AsyncMock()
+        store.delete_client = AsyncMock()
+        resolver = McpCredentialResolver(token_store=store)
+
+        stored = McpOAuthToken(
+            agent_name="test-agent",
+            user_id="user-1",
+            mcp_name="dcr-mcp",
+            access_token="old-access",
+            refresh_token="refresh-me",
+        )
+        server_cfg = {
+            "auth_mode": "dcr",
+            "oauth": {
+                "token_endpoint": "https://mcp.example.com/token",
+            },
+        }
+
+        mock_response = MagicMock()
+        mock_response.status_code = 400
+        mock_response.text = '{"error": "invalid_client"}'
+
+        with (
+            patch.object(
+                resolver,
+                "_resolve_client_credentials",
+                new=AsyncMock(return_value=("cid", "csecret")),
+            ),
+            patch("deep_agent.aegra.mcp_auth.httpx.AsyncClient") as mock_client,
+        ):
+            mock_ctx = AsyncMock(post=AsyncMock(return_value=mock_response))
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await resolver._refresh_mcp_token(stored, server_cfg)
+
+        assert result is None
+        store.delete_client.assert_awaited_once_with("test-agent", "dcr-mcp")
+
+    async def test_refresh_skips_delete_for_non_dcr_auth_mode(self):
+        store = AsyncMock()
+        store.delete_client = AsyncMock()
+        resolver = McpCredentialResolver(token_store=store)
+
+        stored = McpOAuthToken(
+            agent_name="test-agent",
+            user_id="user-1",
+            mcp_name="oauth-mcp",
+            access_token="old-access",
+            refresh_token="refresh-me",
+        )
+        server_cfg = {
+            "auth_mode": "oauth",
+            "oauth": {
+                "token_endpoint": "https://mcp.example.com/token",
+                "client_id": "cid",
+            },
+        }
+
+        mock_response = MagicMock()
+        mock_response.status_code = 401
+        mock_response.text = "Unauthorized"
+
+        with (
+            patch.object(
+                resolver,
+                "_resolve_client_credentials",
+                new=AsyncMock(return_value=("cid", "csecret")),
+            ),
+            patch("deep_agent.aegra.mcp_auth.httpx.AsyncClient") as mock_client,
+        ):
+            mock_ctx = AsyncMock(post=AsyncMock(return_value=mock_response))
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await resolver._refresh_mcp_token(stored, server_cfg)
+
+        assert result is None
+        store.delete_client.assert_not_awaited()
+
+    async def test_refresh_deletes_dcr_client_on_403(self):
+        store = AsyncMock()
+        store.delete_client = AsyncMock()
+        resolver = McpCredentialResolver(token_store=store)
+
+        stored = McpOAuthToken(
+            agent_name="test-agent",
+            user_id="user-1",
+            mcp_name="dcr-mcp",
+            access_token="old-access",
+            refresh_token="refresh-me",
+        )
+        server_cfg = {
+            "auth_mode": "dcr",
+            "oauth": {
+                "token_endpoint": "https://mcp.example.com/token",
+            },
+        }
+
+        mock_response = MagicMock()
+        mock_response.status_code = 403
+        mock_response.text = "Forbidden"
+
+        with (
+            patch.object(
+                resolver,
+                "_resolve_client_credentials",
+                new=AsyncMock(return_value=("cid", "csecret")),
+            ),
+            patch("deep_agent.aegra.mcp_auth.httpx.AsyncClient") as mock_client,
+        ):
+            mock_ctx = AsyncMock(post=AsyncMock(return_value=mock_response))
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await resolver._refresh_mcp_token(stored, server_cfg)
+
+        assert result is None
+        store.delete_client.assert_awaited_once_with("test-agent", "dcr-mcp")
+
+    async def test_refresh_400_without_invalid_client_raises(self):
+        store = AsyncMock()
+        resolver = McpCredentialResolver(token_store=store)
+
+        stored = McpOAuthToken(
+            agent_name="test-agent",
+            user_id="user-1",
+            mcp_name="dcr-mcp",
+            access_token="old-access",
+            refresh_token="refresh-me",
+        )
+        server_cfg = {
+            "auth_mode": "dcr",
+            "oauth": {
+                "token_endpoint": "https://mcp.example.com/token",
+            },
+        }
+
+        import httpx as real_httpx
+
+        mock_response = MagicMock()
+        mock_response.status_code = 400
+        mock_response.text = '{"error": "invalid_grant"}'
+        mock_response.raise_for_status.side_effect = real_httpx.HTTPStatusError(
+            "Bad Request", request=MagicMock(), response=mock_response
+        )
+
+        with (
+            patch.object(
+                resolver,
+                "_resolve_client_credentials",
+                new=AsyncMock(return_value=("cid", "csecret")),
+            ),
+            patch("deep_agent.aegra.mcp_auth.httpx.AsyncClient") as mock_client,
+        ):
+            mock_ctx = AsyncMock(post=AsyncMock(return_value=mock_response))
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await resolver._refresh_mcp_token(stored, server_cfg)
+
+        assert result is None
