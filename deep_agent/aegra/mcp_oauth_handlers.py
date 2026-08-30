@@ -411,6 +411,8 @@ async def handle_mcp_connections(user_id: str) -> dict[str, Any]:
 async def handle_mcp_disconnect(user_id: str, mcp_name: str) -> dict[str, Any]:
     """Clear stored OAuth tokens for *mcp_name* for the current user."""
     server_cfg = _get_mcp_server_config(mcp_name)
+    if server_cfg.get("auth_mode") == "dcr" and not settings.MCP_DCR_ENABLED:
+        raise HTTPException(status_code=403, detail="DCR is disabled")
     _require_interactive_oauth(mcp_name, server_cfg)
 
     store = McpTokenStore(settings.database_uri)

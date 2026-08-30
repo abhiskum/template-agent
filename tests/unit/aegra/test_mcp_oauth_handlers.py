@@ -653,6 +653,76 @@ class TestHandleMcpDisconnect:
         store.delete_token.assert_awaited_once_with("test-agent", "user-1", "oauth-mcp")
         resolver.invalidate_cache.assert_called_once_with("user-1", "oauth-mcp")
 
+    async def test_rejects_dcr_when_feature_disabled(self):
+        store = MagicMock()
+        store.delete_token = AsyncMock()
+        resolver = MagicMock()
+        resolver.invalidate_cache = MagicMock()
+
+        with (
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers._get_mcp_server_config",
+                return_value={
+                    "enabled": True,
+                    "auth_mode": "dcr",
+                    "oauth": {"grant_type": "authorization_code"},
+                },
+            ),
+            patch("deep_agent.aegra.mcp_oauth_handlers.settings") as mock_settings,
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.McpTokenStore",
+                return_value=store,
+            ),
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.get_mcp_credential_resolver",
+                return_value=resolver,
+            ),
+        ):
+            mock_settings.MCP_DCR_ENABLED = False
+            with pytest.raises(HTTPException) as exc:
+                await handle_mcp_disconnect("user-1", "dcr-mcp")
+
+        assert exc.value.status_code == 403
+        assert "DCR is disabled" in str(exc.value.detail)
+        store.delete_token.assert_not_awaited()
+        resolver.invalidate_cache.assert_not_called()
+
+    async def test_disconnects_dcr_when_feature_enabled(self):
+        store = MagicMock()
+        store.delete_token = AsyncMock(return_value=True)
+        resolver = MagicMock()
+        resolver.invalidate_cache = MagicMock()
+        server_cfg = {
+            "enabled": True,
+            "auth_mode": "dcr",
+            "oauth": {"grant_type": "authorization_code"},
+        }
+
+        with (
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers._get_mcp_server_config",
+                return_value=server_cfg,
+            ),
+            patch("deep_agent.aegra.mcp_oauth_handlers.settings") as mock_settings,
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.McpTokenStore",
+                return_value=store,
+            ),
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.get_mcp_credential_resolver",
+                return_value=resolver,
+            ),
+            patch("deep_agent.aegra.mcp.invalidate_mcp_tool_cache"),
+            patch("deep_agent.aegra.graph.invalidate_graph_cache"),
+        ):
+            mock_settings.MCP_DCR_ENABLED = True
+            mock_settings.database_uri = "postgresql://test"
+            mock_settings.agent_deployment_id = "test-agent"
+            result = await handle_mcp_disconnect("user-1", "dcr-mcp")
+
+        assert result == {"mcp_name": "dcr-mcp", "connected": False}
+        store.delete_token.assert_awaited_once_with("test-agent", "user-1", "dcr-mcp")
+
     async def test_rejects_non_oauth_auth_mode(self):
         with patch(
             "deep_agent.aegra.mcp_oauth_handlers._get_mcp_server_config",
