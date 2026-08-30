@@ -614,6 +614,45 @@ class TestHandleMcpDisconnect:
         mock_tools.assert_called_once_with(user_id="user-1")
         mock_graph.assert_called_once_with()
 
+    async def test_disconnect_succeeds_when_graph_cache_invalidation_fails(self):
+        store = MagicMock()
+        store.delete_token = AsyncMock(return_value=True)
+        resolver = MagicMock()
+        resolver.invalidate_cache = MagicMock()
+        server_cfg = {
+            "enabled": True,
+            "auth_mode": "oauth",
+            "oauth": {"grant_type": "authorization_code"},
+        }
+
+        with (
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers._get_mcp_server_config",
+                return_value=server_cfg,
+            ),
+            patch("deep_agent.aegra.mcp_oauth_handlers.settings") as mock_settings,
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.McpTokenStore",
+                return_value=store,
+            ),
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.get_mcp_credential_resolver",
+                return_value=resolver,
+            ),
+            patch("deep_agent.aegra.mcp.invalidate_mcp_tool_cache"),
+            patch(
+                "deep_agent.aegra.graph.invalidate_graph_cache",
+                side_effect=RuntimeError("cache down"),
+            ),
+        ):
+            mock_settings.database_uri = "postgresql://test"
+            mock_settings.agent_deployment_id = "test-agent"
+            result = await handle_mcp_disconnect("user-1", "oauth-mcp")
+
+        assert result == {"mcp_name": "oauth-mcp", "connected": False}
+        store.delete_token.assert_awaited_once_with("test-agent", "user-1", "oauth-mcp")
+        resolver.invalidate_cache.assert_called_once_with("user-1", "oauth-mcp")
+
     async def test_rejects_non_oauth_auth_mode(self):
         with patch(
             "deep_agent.aegra.mcp_oauth_handlers._get_mcp_server_config",
