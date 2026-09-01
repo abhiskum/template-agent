@@ -22,11 +22,12 @@ def _extract_needs_authorization(exc: BaseException) -> NeedsAuthorization | Non
         found = _extract_needs_authorization(sub)
         if found is not None:
             return found
-    cause = getattr(exc, "__cause__", None)
-    if cause is not None and cause is not exc:
-        found = _extract_needs_authorization(cause)
-        if found is not None:
-            return found
+    for attr in ("__cause__", "__context__"):
+        chained = getattr(exc, attr, None)
+        if chained is not None and chained is not exc:
+            found = _extract_needs_authorization(chained)
+            if found is not None:
+                return found
     return None
 
 

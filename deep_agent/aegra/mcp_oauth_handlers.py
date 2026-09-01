@@ -493,14 +493,14 @@ async def handle_mcp_oauth_callback(
     current_agent_name = settings.agent_deployment_id
     client_id: str | None = None
     client_secret: str | None = None
-    if auth_mode == "oauth":
-        client_id = oauth_cfg.get("client_id")
-        client_secret = resolve_oauth_client_secret(oauth_cfg, mcp_name)
-    else:
+    if auth_mode == "dcr":
         manager = get_dcr_client_manager()
         client_id, client_secret = await manager.ensure_valid_client(
             current_agent_name, mcp_name, oauth_cfg, server_cfg
         )
+    else:
+        client_id = oauth_cfg.get("client_id")
+        client_secret = resolve_oauth_client_secret(oauth_cfg, mcp_name)
 
     if not client_id:
         return HTMLResponse(

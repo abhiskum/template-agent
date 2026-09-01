@@ -211,7 +211,7 @@ class TestMcpTokenStoreRedis:
 
     async def test_delete_client_returns_true_when_row_deleted(self, store):
         with (
-            patch.object(store, "ensure_tables"),
+            patch.object(store, "ensure_tables", new=AsyncMock()) as mock_ensure,
             patch("deep_agent.aegra.mcp_token_store.psycopg") as mock_psycopg,
         ):
             mock_cur = AsyncMock()
@@ -225,14 +225,17 @@ class TestMcpTokenStoreRedis:
 
             result = await store.delete_client("default", "dcr-mcp")
 
-        assert result is True
-        mock_conn.execute.assert_awaited_once()
-        sql_arg = mock_conn.execute.call_args[0][0]
-        assert "DELETE FROM mcp_oauth_clients" in sql_arg
+            assert result is True
+            mock_ensure.assert_awaited_once()
+            mock_conn.execute.assert_awaited_once()
+            sql_arg, params = mock_conn.execute.call_args[0]
+            assert "DELETE FROM mcp_oauth_clients" in sql_arg
+            assert params == ("default", "dcr-mcp")
+            mock_conn.commit.assert_awaited_once()
 
     async def test_delete_client_returns_false_when_no_row(self, store):
         with (
-            patch.object(store, "ensure_tables"),
+            patch.object(store, "ensure_tables", new=AsyncMock()) as mock_ensure,
             patch("deep_agent.aegra.mcp_token_store.psycopg") as mock_psycopg,
         ):
             mock_cur = AsyncMock()
@@ -246,4 +249,10 @@ class TestMcpTokenStoreRedis:
 
             result = await store.delete_client("default", "nonexistent-mcp")
 
-        assert result is False
+            assert result is False
+            mock_ensure.assert_awaited_once()
+            mock_conn.execute.assert_awaited_once()
+            sql_arg, params = mock_conn.execute.call_args[0]
+            assert "DELETE FROM mcp_oauth_clients" in sql_arg
+            assert params == ("default", "nonexistent-mcp")
+            mock_conn.commit.assert_awaited_once()

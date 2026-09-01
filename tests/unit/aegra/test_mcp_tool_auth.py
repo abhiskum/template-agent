@@ -158,6 +158,12 @@ class TestExtractNeedsAuthorization:
         group = ExceptionGroup("empty", [ValueError("a"), RuntimeError("b")])
         assert _extract_needs_authorization(group) is None
 
+    def test_unwraps_from_context(self):
+        inner = NeedsAuthorization("mcp-x", "/connect")
+        outer = RuntimeError("implicit wrapper")
+        outer.__context__ = inner
+        assert _extract_needs_authorization(outer) is inner
+
 
 class TestSafeAinvokeExceptionGroupUnwrap:
     @pytest.mark.asyncio
@@ -183,6 +189,25 @@ class TestSafeAinvokeExceptionGroupUnwrap:
         mock_interrupt.assert_called_once()
         payload = mock_interrupt.call_args[0][0]
         assert "gitlab-mcp" in payload
+
+    @pytest.mark.asyncio
+    async def test_exception_group_with_needs_auth_retries_after_interrupt(self):
+        """After interrupt returns normally, safe_ainvoke retries and returns the result."""
+        inner = NeedsAuthorization("gitlab-mcp", "/mcp/gitlab-mcp/connect")
+        group = ExceptionGroup("unhandled errors in a TaskGroup", [inner])
+
+        tool = _make_mock_tool()
+        tool.ainvoke = AsyncMock(side_effect=[group, "retry-ok"])
+
+        wrapped = _wrap_single_tool(tool)
+
+        with patch(
+            "deep_agent.aegra.mcp_tool_auth.interrupt",
+            return_value=None,
+        ):
+            result = await wrapped.ainvoke({"id": "call_retry"})
+
+        assert result == "retry-ok"
 
     @pytest.mark.asyncio
     async def test_exception_group_without_needs_auth_returns_tool_error(self):

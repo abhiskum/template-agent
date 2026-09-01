@@ -699,6 +699,9 @@ class TestRefreshMcpTokenInvalidClient:
                 new=AsyncMock(return_value=("cid", "sec")),
             ),
             patch("deep_agent.aegra.mcp_auth.httpx.AsyncClient") as mock_client,
+            patch(
+                "deep_agent.aegra.mcp_oauth_handlers.get_dcr_client_manager"
+            ) as mock_get_manager,
         ):
             mock_ctx = AsyncMock(post=AsyncMock(return_value=mock_response))
             mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
@@ -707,6 +710,7 @@ class TestRefreshMcpTokenInvalidClient:
             result = await resolver._refresh_mcp_token(stored_token, server_cfg)
 
         assert result is None
+        mock_get_manager.assert_not_called()
 
     async def test_successful_refresh_unaffected_by_dcr_check(self):
         store = AsyncMock()
